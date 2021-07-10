@@ -1,8 +1,7 @@
 // client provides a client for the Viteset API, allowing users to fetch blob values and subscribe to updates.
-package client
+package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -10,14 +9,17 @@ import (
 	"time"
 )
 
+const VERSION = "1.0.0"
 const DEFAULT_HOST = "https://api.viteset.com"
 const DEFAULT_INTERVAL = time.Minute
+
+var userAgent = fmt.Sprintf("Viteset-Client-Go/%s", VERSION)
 
 // Client accesses a blob from Viteset and sends updates via a channel. To start using a Client, call
 // `client.Subscribe()`.
 type Client struct {
-	Key      string        // The key for the blob
-	Secret   string        // The secret for a client with access to the blob
+	Secret   string        // The secret for a client with access to the specified blob
+	Blob     string        // The name of the blob to subscribe to
 	Interval time.Duration // The time between checking for updates
 	Host     string        // The hostname of the Viteset API, default: Viteset production servers
 	last     []byte        // The last-retrieved value for the blob
@@ -39,8 +41,8 @@ func (c *Client) Subscribe() (<-chan Update, error) {
 	if c.ticker != nil {
 		return nil, errors.New("cannot re-subscribe with a closed Client")
 	}
-	if c.Key == "" {
-		return nil, errors.New("missing key")
+	if c.Blob == "" {
+		return nil, errors.New("missing blob name")
 	}
 	if c.Secret == "" {
 		return nil, errors.New("missing secret")
@@ -52,42 +54,71 @@ func (c *Client) Subscribe() (<-chan Update, error) {
 		c.Interval = time.Duration(DEFAULT_INTERVAL)
 	}
 
+	var lastEtag *string = nil
 	ch := make(chan Update)
-	ticker := time.NewTicker(c.Interval)
+	c.ticker = time.NewTicker(c.Interval)
+
 	go func() {
 		for {
-			data, err := c.fetch()
+			same, data, etag, err := c.fetch(lastEtag)
 			if err != nil {
+				// something went wrong
 				ch <- Update{Error: err}
-			} else if !bytes.Equal(data, c.last) {
+			} else if same {
+				// value has not changed; do nothing
+			} else {
+				// value has changed
 				ch <- Update{Value: data}
 				c.last = data
+				lastEtag = etag
 			}
-			<-ticker.C
+			<-c.ticker.C
 		}
 	}()
-	c.ticker = ticker
+
 	return ch, nil
 }
 
 // Cancel cancels a subscription. No further updates will be sent on this channel. Do not reuse this Client or channel.
 func (c *Client) Cancel() {
-	if c.ticker != nil {
+	if c.Active() {
 		c.ticker.Stop()
+		c.ticker = nil
 	}
 }
 
-// fetch retrieves the latest value for the blob.
-func (c *Client) fetch() ([]byte, error) {
+// Active returns True if this Client is actively subscribed to a blob and False if the subscription has been Canceled.
+func (c *Client) Active() bool {
+	return c.ticker != nil
+}
+
+// fetch retrieves the latest value for the blob, obeying caching logic if we have a copy of this blob from the past.
+func (c *Client) fetch(lastEtag *string) (same bool, data []byte, etag *string, err error) {
 	client := &http.Client{}
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", c.Host, c.Key), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", c.Host, c.Blob), nil)
 	if err != nil {
-		return nil, err
+		return false, nil, nil, err
 	}
+	req.Header.Add("User-Agent", userAgent)
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", c.Secret))
+	if lastEtag != nil {
+		req.Header.Add("If-None-Match", *lastEtag)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return false, nil, nil, err
 	}
-	return ioutil.ReadAll(resp.Body)
+	data, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	if resp.StatusCode == http.StatusNotModified {
+		return true, nil, nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		err = fmt.Errorf("expected status code %d but got %d: `%s`", http.StatusOK, resp.StatusCode, data)
+		return false, nil, nil, err
+	}
+	t := resp.Header.Get("ETag")
+	return false, data, &t, err
 }
