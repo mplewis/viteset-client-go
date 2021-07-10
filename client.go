@@ -1,5 +1,5 @@
 // client provides a client for the Viteset API, allowing users to fetch blob values and subscribe to updates.
-package main
+package client
 
 import (
 	"errors"
