@@ -1,4 +1,31 @@
-// client provides a client for the Viteset API, allowing users to fetch blob values and subscribe to updates.
+// A client for the Viteset API, allowing users to fetch blob values and subscribe to updates.
+//
+// To get started, create a Client for your target blob, then call Subscribe to start receiving updates:
+//
+//     c := Client{
+//         Blob:   "SOME_BLOB_NAME",
+//         Secret: "SOME_CLIENT_SECRET",
+//     }
+//
+//     updates, err := c.Subscribe()
+//     if err != nil {
+//         // Uh-oh! Subscription failed. Check your Blob and Secret values.
+//         log.Panic(err)
+//     }
+//
+//     for {
+//         update := <-updates
+//         if update.err != nil {
+//             // Failure to fetch an update isn't all that bad.
+//             // Just use the last cached value for now.
+//             log.Println(err)
+//             break
+//         }
+//
+//         // Blob values are provided as []byte,
+//         // which you can pass to your parser of choice
+//         updateMyAppConfig(update.Value)
+//     }
 package client
 
 import (
@@ -9,37 +36,61 @@ import (
 	"time"
 )
 
+// The package version.
 const VERSION = "1.0.0"
+
+// The default Viteset host to fetch blobs from.
 const DEFAULT_HOST = "https://api.viteset.com"
-const DEFAULT_INTERVAL = time.Minute
+
+// The default interval for polling for blob updates.
+const DEFAULT_INTERVAL = 15 * time.Second
 
 var userAgent = fmt.Sprintf("Viteset-Client-Go/%s", VERSION)
 
-// Client accesses a blob from Viteset and sends updates via a channel. To start using a Client, call
-// `client.Subscribe()`.
+// Client accesses a blob from Viteset and sends updates via a channel.
+// The Client uses ETags to minimize data received when the blob hasn't changed since the last poll.
 type Client struct {
-	Secret   string        // The secret for a client with access to the specified blob
-	Blob     string        // The name of the blob to subscribe to
-	Interval time.Duration // The time between checking for updates
-	Host     string        // The hostname of the Viteset API, default: Viteset production servers
-	last     []byte        // The last-retrieved value for the blob
-	ticker   *time.Ticker  // The ticker that checks for updates to the blob at an interval
+	// The secret for a client with access to the specified blob
+	Secret string
+
+	// The name of the blob to subscribe to
+	Blob string
+
+	// Optional: The update polling interval. Default is 15 seconds.
+	// Please don't reduce this below 15 seconds: this greatly impacts load on Viteset servers.
+	Interval time.Duration
+
+	// Optional: The hostname of the Viteset API. Default is Viteset production servers.
+	Host string
+
+	// The last-retrieved value for the blob
+	last []byte
+
+	// The ticker that polls for updates to the blob at an interval
+	ticker *time.Ticker
 }
 
-// Update contains either a blob's new value, or an error that occurred during the last fetch. You must ensure
-// `update.Error != nil` before reading the value. You may want to simply log and ignore errors; it is possible
-// that a temporary network issue will resolve itself over time.
+// Update contains either a blob's latest value, or an error that occurred during the last fetch. You must check
+// update.Error before reading the value.
+//
+// You may want to simply log and ignore these errors.
+// Temporary network issues will likely resolve themselves over time.
 type Update struct {
 	Value []byte
 	Error error
 }
 
-// Subscribe starts watching the blob for changes. It returns a channel, via which updates to the blob value will
-// be sent to the application, and an error if the subscription could not be created. The channel always emits the
-// blob's initial value upon first fetch.
+// Subscribe starts watching the blob for changes. It returns a channel and an error.
+//
+// If the subscription is successful, the Client returns an Update channel,
+// sends the initial blob value into the channel, and sends any future blob values into the channel.
+//
+// If the subscription is unsuccessful, the error will be set.
+//
+// On a successful subscription, the Client will always send the initial value of the blob via the channel.
 func (c *Client) Subscribe() (<-chan Update, error) {
-	if c.ticker != nil {
-		return nil, errors.New("cannot re-subscribe with a closed Client")
+	if c.Active() {
+		return nil, errors.New("client subscription is already active")
 	}
 	if c.Blob == "" {
 		return nil, errors.New("missing blob name")
@@ -79,7 +130,9 @@ func (c *Client) Subscribe() (<-chan Update, error) {
 	return ch, nil
 }
 
-// Cancel cancels a subscription. No further updates will be sent on this channel. Do not reuse this Client or channel.
+// Cancel cancels a subscription. This Client will stop polling, and no further updates will be sent on its channel.
+//
+// Reusing a canceled Client is not supported.
 func (c *Client) Cancel() {
 	if c.Active() {
 		c.ticker.Stop()
@@ -87,7 +140,7 @@ func (c *Client) Cancel() {
 	}
 }
 
-// Active returns True if this Client is actively subscribed to a blob and False if the subscription has been Canceled.
+// Active returns True if this Client is actively subscribed to a blob and False otherwise.
 func (c *Client) Active() bool {
 	return c.ticker != nil
 }
